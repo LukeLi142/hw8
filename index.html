@@ -12,33 +12,43 @@ let hands=null,stream=null,running=false,busy=false,lastFrame=0,lastDetected=nul
 const chains=[[0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20]];
 const distance=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
 const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
-// 使用手指關節夾角與指尖到掌心的距離，避免合成資料分類器對真實手掌誤判。
-// 僅判斷清楚的張手(至少 3 指伸直)或握拳(最多 1 指伸直)，不確定時不觸發。
-function jointAngle(a,b,c){
- const ux=a.x-b.x,uy=a.y-b.y,uz=(a.z||0)-(b.z||0);
- const vx=c.x-b.x,vy=c.y-b.y,vz=(c.z||0)-(b.z||0);
- const dot=ux*vx+uy*vy+uz*vz;
- const lengths=Math.hypot(ux,uy,uz)*Math.hypot(vx,vy,vz);
- return Math.acos(clamp(dot/Math.max(lengths,1e-8),-1,1))*180/Math.PI;
+// 二維投影手指判斷：不混用 MediaPipe z 軸（z 的單位/透視會扭曲關節角度）。
+// 先判斷 4 根長手指各自是伸直、收攏或不確定；只有 3 根以上明確收攏才會判握拳。
+function angle2D(a,b,c){
+ const ux=a.x-b.x,uy=a.y-b.y,vx=c.x-b.x,vy=c.y-b.y;
+ const d=Math.hypot(ux,uy)*Math.hypot(vx,vy);
+ return Math.acos(clamp((ux*vx+uy*vy)/Math.max(d,1e-8),-1,1))*180/Math.PI;
 }
 function classify(points){
- const palm={x:(points[0].x+points[5].x+points[9].x+points[13].x+points[17].x)/5,
-             y:(points[0].y+points[5].y+points[9].y+points[13].y+points[17].y)/5};
- const fingers=[[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]];
  let extended=0,curled=0;
- for(const [mcp,pip,dip,tip] of fingers){
-   const bend=jointAngle(points[mcp],points[pip],points[dip]);
-   const distal=jointAngle(points[pip],points[dip],points[tip]);
-   const tipDist=distance(points[tip],palm);
-   const pipDist=distance(points[pip],palm);
-   // 關節接近伸直，且指尖明顯比第二關節遠離掌心。
-   if(bend>151 && distal>146 && tipDist>pipDist*1.15)extended++;
-   else if(bend<133 || tipDist<pipDist*1.02)curled++;
+ const diagnostics=[];
+ // wrist-to-MCP 做尺度參考。比純粹計算 PIP/DIP 的 3D 角度穩定。
+ for(const [mcp,pip,dip,tip] of [[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]]){
+   const base=distance(points[0],points[mcp]);
+   const tipW=distance(points[0],points[tip]);
+   const pipW=distance(points[0],points[pip]);
+   const tipM=distance(points[mcp],points[tip]);
+   const pipM=distance(points[mcp],points[pip]);
+   const joint=angle2D(points[mcp],points[pip],points[dip]);
+   const distal=angle2D(points[pip],points[dip],points[tip]);
+   // 直指：指尖向外伸展，且至少一個指節角度接近伸直。
+   // 注意：手掌側轉時二維關節角可能壓縮，故容許用指尖/根部距離作第二證據。
+   const out=tipW>pipW*1.09 && tipM>pipM*1.47;
+   const straight=joint>147 || (joint>132 && distal>145);
+   const isExtended=out && (straight || tipM>pipM*2.05);
+   // 拳頭：指尖縮回根部附近，且不呈現向外伸展狀態。
+   const isCurled=!isExtended && (
+     (tipW<pipW*0.97 && tipM<pipM*1.55) ||
+     (tipM<pipM*1.22 && joint<132)
+   );
+   if(isExtended)extended++;
+   else if(isCurled)curled++;
+   diagnostics.push(isExtended?'直':isCurled?'彎':'?');
  }
- let label='uncertain',open=0.5,fist=0.5;
- if(extended>=3){label='open';open=extended===4?0.96:0.88;fist=1-open;}
- else if(extended<=1 && curled>=3){label='fist';fist=curled===4?0.96:0.88;open=1-fist;}
- return {open,fist,label,extended,curled};
+ let label='uncertain',open=.5,fist=.5;
+ if(extended>=3 && curled<=1){label='open';open=extended===4?.97:.89;fist=1-open;}
+ else if(curled>=3 && extended===0){label='fist';fist=curled===4?.96:.88;open=1-fist;}
+ return {open,fist,label,extended,curled,diagnostics};
 }
 function setMode(mode){let e=$('effect');e.className='effect '+mode; if(mode==='sun'){$('object').textContent='☀';$('effectTitle').textContent='日光魔法成功！';$('effectSub').textContent='你用張開的手掌喚醒了白晝';}else{$('object').textContent='☾';$('effectTitle').textContent='星夜魔法成功！';$('effectSub').textContent='你用握拳召喚出靜謐夜空';}}
 function updateScores(open,fist,gesture){
@@ -49,9 +59,9 @@ function updateScores(open,fist,gesture){
 function clearResult(label='尚未辨識'){$('gesture').textContent=label;$('detail').textContent='請將一隻手完整放入畫面';['confidence','openScore','fistScore'].forEach(id=>$(id).textContent='0%');['fill','openBar','fistBar'].forEach(id=>$(id).style.width='0%');lastDetected=null;streak=0;}
 function onResults(results){if(!running)return;const rect=video.getBoundingClientRect();const w=Math.max(1,Math.round(rect.width)),h=Math.max(1,Math.round(rect.height));if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}ctx.clearRect(0,0,w,h);const landmarks=results.multiHandLandmarks?.[0];if(!landmarks){clearResult('未偵測到手掌');$('status').textContent='尋找手部中…';return;}
  ctx.lineWidth=3;ctx.strokeStyle='#91f2d5';ctx.fillStyle='#eafaf5';for(const chain of chains){ctx.beginPath();chain.forEach((idx,j)=>{const p=landmarks[idx];if(j===0)ctx.moveTo(p.x*w,p.y*h);else ctx.lineTo(p.x*w,p.y*h)});ctx.stroke();}for(const p of landmarks){ctx.beginPath();ctx.arc(p.x*w,p.y*h,3,0,Math.PI*2);ctx.fill();}
- const {open,fist,label}=classify(landmarks);const best=Math.max(open,fist);const category=label;const stable=label!=='uncertain' && best>=.85;if(!stable){lastDetected=null;streak=0;updateScores(open,fist,'辨識中…');$('status').textContent='正在確認姿勢';return;}
+ const {open,fist,label,extended,curled,diagnostics}=classify(landmarks);$('detail').textContent='四指狀態：'+diagnostics.join(' / ')+'（伸直 '+extended+'，彎曲 '+curled+'）';const best=Math.max(open,fist);const category=label;const stable=label!=='uncertain' && best>=.85;if(!stable){lastDetected=null;streak=0;updateScores(open,fist,'辨識中…');$('detail').textContent='四指狀態：'+diagnostics.join(' / ')+'（伸直 '+extended+'，彎曲 '+curled+'）';$('status').textContent='正在確認姿勢';return;}
  if(lastDetected===category)streak++;else{lastDetected=category;streak=1;}
- updateScores(open,fist,category==='open'?'張開手掌':'握拳');$('status').textContent='已偵測到手部';
+ updateScores(open,fist,category==='open'?'張開手掌':'握拳');$('detail').textContent='四指狀態：'+diagnostics.join(' / ')+'（伸直 '+extended+'，彎曲 '+curled+'）';$('status').textContent='已偵測到手部';
  if(streak>=9&&lastTriggered!==category){lastTriggered=category;triggers++;$('count').textContent='成功觸發 '+triggers+' 次';setMode(category==='open'?'sun':'night');}
 }
 async function start(){if(running)return;const button=$('start');button.disabled=true;$('status').textContent='正在載入手勢模型…';$('status').classList.remove('error');try{if(!window.Hands)throw Error('MediaPipe 函式庫載入失敗，請確認網路連線。');if(!navigator.mediaDevices?.getUserMedia)throw Error('請使用 HTTPS 網站或 localhost 才能存取攝影機。');hands=new Hands({locateFile:file=>'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/'+file});hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.6});hands.onResults(onResults);stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:'user',width:{ideal:960},height:{ideal:720}}});video.srcObject=stream;await video.play();running=true;$('standby').style.display='none';$('cameraState').textContent='鏡頭運作中';$('status').textContent='尋找手部中…';$('stop').disabled=false;requestAnimationFrame(loop);}catch(err){$('status').textContent='啟動失敗：'+(err.message||err);$('status').classList.add('error');await stop();}finally{button.disabled=running;}}
